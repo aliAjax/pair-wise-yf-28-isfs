@@ -86,9 +86,24 @@ class RandomizationStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     participant_id INTEGER NOT NULL REFERENCES participants(id),
                     requester_id TEXT NOT NULL REFERENCES users(id), reason TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','materials_pending','approved','rejected')),
                     first_approver TEXT REFERENCES users(id), second_approver TEXT REFERENCES users(id),
+                    amendment_id INTEGER,
                     decided_at TEXT, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS protocol_amendments(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_no TEXT NOT NULL UNIQUE,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    new_version TEXT NOT NULL, reason TEXT NOT NULL,
+                    arms_json TEXT NOT NULL, strata_factors_json TEXT NOT NULL,
+                    block_size INTEGER NOT NULL, seed TEXT NOT NULL,
+                    enrolled_snapshot_json TEXT NOT NULL, enrolled_count INTEGER NOT NULL,
+                    compatibility_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending_review','approved','returned')),
+                    submitted_by TEXT NOT NULL REFERENCES users(id), submitted_at TEXT NOT NULL,
+                    reviewed_by TEXT REFERENCES users(id), reviewed_at TEXT, review_note TEXT
                 );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, trial_id INTEGER REFERENCES trials(id),
@@ -97,6 +112,29 @@ class RandomizationStore:
                 );
                 """
             )
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(unblinding_requests)").fetchall()}
+            if cols and "amendment_id" not in cols:
+                conn.execute("PRAGMA foreign_keys=OFF")
+                conn.executescript(
+                    """
+                    ALTER TABLE unblinding_requests RENAME TO unblinding_requests_old;
+                    CREATE TABLE unblinding_requests(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        participant_id INTEGER NOT NULL REFERENCES participants(id),
+                        requester_id TEXT NOT NULL REFERENCES users(id), reason TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','materials_pending','approved','rejected')),
+                        first_approver TEXT REFERENCES users(id), second_approver TEXT REFERENCES users(id),
+                        amendment_id INTEGER,
+                        decided_at TEXT, created_at TEXT NOT NULL
+                    );
+                    INSERT INTO unblinding_requests
+                        SELECT id,participant_id,requester_id,reason,status,first_approver,second_approver,NULL,decided_at,created_at
+                        FROM unblinding_requests_old;
+                    DROP TABLE unblinding_requests_old;
+                    """
+                )
+                conn.execute("PRAGMA foreign_keys=ON")
 
     def seed(self):
         self.init_schema()
@@ -201,6 +239,180 @@ class RandomizationStore:
             self._audit(conn, trial_id, user_id, "trial.start", {})
             return {"id": trial_id, "status": "running"}
 
+    def _check_amendment_compatibility(self, conn, trial, new_arms, new_strata, new_block):
+        """核对旧分层能否沿用到新版本：分层因素集合不变且既有分组全部保留才兼容。"""
+        old_arms = json.loads(trial["arms_json"])
+        old_strata = json.loads(trial["strata_factors_json"])
+        check = {
+            "strata_factors_same": set(new_strata) == set(old_strata),
+            "old_arms_preserved": all(a in new_arms for a in old_arms),
+            "block_size_multiple_of_arms": new_block % len(new_arms) == 0 and new_block >= len(new_arms),
+        }
+        check["compatible"] = all(check.values())
+        reasons = []
+        if not check["strata_factors_same"]:
+            reasons.append(f"分层因素集合发生变化（旧：{', '.join(old_strata)}），既有分层无法沿用")
+        if not check["old_arms_preserved"]:
+            removed = [a for a in old_arms if a not in new_arms]
+            reasons.append(f"新版本删除了已入组使用的分组：{', '.join(removed)}")
+        if not check["block_size_multiple_of_arms"]:
+            reasons.append("新区组长度不是分组数的整数倍")
+        return check, reasons
+
+    def submit_amendment(self, user_id, trial_id, new_version, reason, arms, strata_factors, block_size, seed):
+        reason = (reason or "").strip()
+        new_version = (new_version or "").strip()
+        if not new_version:
+            raise BusinessError("新版本号不能为空", 422, "invalid_amendment")
+        if len(reason) < 8:
+            raise BusinessError("修订原因至少 8 字", 422, "reason_required")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"coordinator"})
+            trial = self._trial(conn, trial_id)
+            if trial["status"] != "running":
+                raise BusinessError("只有入组进行中的试验可以提交版本修订", 409, "invalid_status")
+            open_amendment = conn.execute(
+                "SELECT id FROM protocol_amendments WHERE trial_id=? AND status='pending_review'", (trial_id,)
+            ).fetchone()
+            if open_amendment:
+                raise BusinessError("该试验已有待审核的版本申请", 409, "amendment_pending")
+            old_arms = json.loads(trial["arms_json"])
+            new_arms = arms if arms is not None else old_arms
+            new_strata = strata_factors if strata_factors is not None else json.loads(trial["strata_factors_json"])
+            new_block = block_size if block_size is not None else trial["block_size"]
+            new_seed = str(seed) if seed is not None else trial["seed"]
+            self.create_trial_validation_only(new_arms, new_strata, new_block, new_seed)
+            check, reasons = self._check_amendment_compatibility(conn, trial, new_arms, new_strata, new_block)
+            enrolled_rows = conn.execute(
+                "SELECT id,external_id,site_id,allocation_code,created_at FROM participants WHERE trial_id=? ORDER BY id",
+                (trial_id,),
+            ).fetchall()
+            snapshot = [dict(r) for r in enrolled_rows]
+            next_no = conn.execute("SELECT COALESCE(MAX(id),0)+1 FROM protocol_amendments").fetchone()[0]
+            application_no = f"AMD-{trial_id}-{next_no:03d}"
+            cur = conn.execute(
+                """INSERT INTO protocol_amendments(application_no,trial_id,new_version,reason,arms_json,strata_factors_json,
+                       block_size,seed,enrolled_snapshot_json,enrolled_count,compatibility_json,status,submitted_by,submitted_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (application_no, trial_id, new_version, reason, json.dumps(new_arms, ensure_ascii=False),
+                 json.dumps(new_strata, ensure_ascii=False), new_block, new_seed,
+                 json.dumps(snapshot, ensure_ascii=False), len(snapshot),
+                 json.dumps(check, ensure_ascii=False, sort_keys=True),
+                 "pending_review" if check["compatible"] else "returned",
+                 user_id, now()),
+            )
+            amendment_id = cur.lastrowid
+            if check["compatible"]:
+                self._audit(conn, trial_id, user_id, "amendment.submit",
+                            {"application_no": application_no, "new_version": new_version, "enrolled_count": len(snapshot)})
+                result_status = "pending_review"
+            else:
+                note = "系统核对退回：" + "；".join(reasons)
+                conn.execute(
+                    "UPDATE protocol_amendments SET status='returned',reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",
+                    (user_id, now(), note, amendment_id),
+                )
+                self._audit(conn, trial_id, user_id, "amendment.returned",
+                            {"application_no": application_no, "reasons": reasons})
+                result_status = "returned"
+            return {
+                "id": amendment_id, "application_no": application_no, "trial_id": trial_id,
+                "new_version": new_version, "reason": reason, "status": result_status,
+                "enrolled_count": len(snapshot), "enrolled": snapshot,
+                "compatibility": check, "incompatible_reasons": [] if check["compatible"] else reasons,
+            }
+
+    def list_amendments(self, user_id, trial_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            rows = conn.execute(
+                "SELECT * FROM protocol_amendments WHERE trial_id=? ORDER BY id", (trial_id,)
+            ).fetchall()
+            return [self._amendment_dict(r) for r in rows]
+
+    def _amendment_dict(self, row):
+        return {
+            "id": row["id"], "application_no": row["application_no"], "trial_id": row["trial_id"],
+            "new_version": row["new_version"], "reason": row["reason"],
+            "arms": json.loads(row["arms_json"]), "strata_factors": json.loads(row["strata_factors_json"]),
+            "block_size": row["block_size"], "enrolled_count": row["enrolled_count"],
+            "enrolled": json.loads(row["enrolled_snapshot_json"]),
+            "compatibility": json.loads(row["compatibility_json"]),
+            "status": row["status"], "submitted_by": row["submitted_by"], "submitted_at": row["submitted_at"],
+            "reviewed_by": row["reviewed_by"], "reviewed_at": row["reviewed_at"], "review_note": row["review_note"],
+        }
+
+    def review_amendment(self, user_id, amendment_id, decision, note=""):
+        if decision not in ("approve", "return"):
+            raise BusinessError("审核结论必须是 approve 或 return", 422, "invalid_decision")
+        note = (note or "").strip()
+        if decision == "return" and len(note) < 4:
+            raise BusinessError("退回时必须填写退回说明", 422, "note_required")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator", "monitor"})
+                row = conn.execute("SELECT * FROM protocol_amendments WHERE id=?", (amendment_id,)).fetchone()
+                if not row:
+                    raise BusinessError("版本申请不存在", 404, "not_found")
+                if row["status"] != "pending_review":
+                    raise BusinessError("该版本申请已完成审核", 409, "already_decided")
+                amendment = self._amendment_dict(row)
+                if decision == "approve":
+                    conn.execute(
+                        """UPDATE trials SET protocol_version=?,arms_json=?,strata_factors_json=?,block_size=?,seed=? WHERE id=?""",
+                        (amendment["new_version"], json.dumps(amendment["arms"], ensure_ascii=False),
+                         json.dumps(amendment["strata_factors"], ensure_ascii=False),
+                         amendment["block_size"], row["seed"], row["trial_id"]),
+                    )
+                    conn.execute(
+                        "UPDATE protocol_amendments SET status='approved',reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",
+                        (user_id, now(), note or "审核通过，旧分层沿用", amendment_id),
+                    )
+                    self._audit(conn, row["trial_id"], user_id, "amendment.approve",
+                                {"application_no": amendment["application_no"], "new_version": amendment["new_version"]})
+                else:
+                    conn.execute(
+                        "UPDATE protocol_amendments SET status='returned',reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",
+                        (user_id, now(), note, amendment_id),
+                    )
+                    self._audit(conn, row["trial_id"], user_id, "amendment.return",
+                                {"application_no": amendment["application_no"], "note": note})
+                # 版本申请有结论后，挂起的紧急揭盲转为正常待审批
+                held = conn.execute(
+                    "SELECT id FROM unblinding_requests WHERE amendment_id=? AND status='materials_pending'",
+                    (amendment_id,),
+                ).fetchall()
+                for item in held:
+                    conn.execute("UPDATE unblinding_requests SET status='pending' WHERE id=?", (item["id"],))
+                    self._audit(conn, row["trial_id"], user_id, "unblinding.resume",
+                                {"request_id": item["id"], "application_no": amendment["application_no"]})
+                return {"id": amendment_id, "application_no": amendment["application_no"],
+                        "status": "approved" if decision == "approve" else "returned",
+                        "released_requests": [r["id"] for r in held]}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def trial_config(self, user_id, trial_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            trial = self._trial(conn, trial_id)
+            open_amendment = conn.execute(
+                "SELECT id,application_no,new_version,submitted_at FROM protocol_amendments WHERE trial_id=? AND status='pending_review'",
+                (trial_id,),
+            ).fetchone()
+            return {
+                "id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"],
+                "status": trial["status"], "arms": json.loads(trial["arms_json"]),
+                "strata_factors": json.loads(trial["strata_factors_json"]),
+                "block_size": trial["block_size"],
+                "enrollment_paused": open_amendment is not None,
+                "pending_amendment": dict(open_amendment) if open_amendment else None,
+                "viewer_role": actor["role"],
+            }
+
     def _stratum(self, conn, trial, factors, site_id):
         expected = json.loads(trial["strata_factors_json"])
         if set(factors) != set(expected):
@@ -257,6 +469,15 @@ class RandomizationStore:
                 trial = self._trial(conn, trial_id)
                 if trial["status"] != "running":
                     raise BusinessError("试验尚未开始或已经停止", 409, "trial_not_running")
+                open_amendment = conn.execute(
+                    "SELECT application_no FROM protocol_amendments WHERE trial_id=? AND status='pending_review'",
+                    (trial_id,),
+                ).fetchone()
+                if open_amendment:
+                    raise BusinessError(
+                        f"方案修订 {open_amendment['application_no']} 审核期间暂停新入组",
+                        409, "enrollment_paused",
+                    )
                 existing = conn.execute(
                     "SELECT * FROM participants WHERE trial_id=? AND external_id=?", (trial_id, external_id)
                 ).fetchone()
@@ -328,23 +549,77 @@ class RandomizationStore:
         if len(reason.strip()) < 8:
             raise BusinessError("揭盲原因至少 8 字", 422, "reason_required")
         with self.connect() as conn:
-            actor = self._user(conn, user_id, {"site", "coordinator"})
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
             participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
             if not participant:
                 raise BusinessError("受试者不存在", 404, "not_found")
             if actor["role"] == "site" and participant["site_id"] != actor["site_id"]:
                 raise BusinessError("不能申请其他中心的揭盲", 403, "site_isolation")
             open_request = conn.execute(
-                "SELECT id FROM unblinding_requests WHERE participant_id=? AND status='pending'", (participant_id,)
+                "SELECT id FROM unblinding_requests WHERE participant_id=? AND status IN ('pending','materials_pending')",
+                (participant_id,),
             ).fetchone()
             if open_request:
-                raise BusinessError("该受试者已有待审批的揭盲申请", 409, "request_exists")
+                raise BusinessError("该受试者已有进行中的揭盲申请", 409, "request_exists")
+            open_amendment = conn.execute(
+                "SELECT id,application_no FROM protocol_amendments WHERE trial_id=? AND status='pending_review'",
+                (participant["trial_id"],),
+            ).fetchone()
+            status = "materials_pending" if open_amendment else "pending"
             cur = conn.execute(
-                "INSERT INTO unblinding_requests(participant_id,requester_id,reason,created_at) VALUES(?,?,?,?)",
-                (participant_id, user_id, reason.strip(), now()),
+                "INSERT INTO unblinding_requests(participant_id,requester_id,reason,status,amendment_id,created_at) VALUES(?,?,?,?,?,?)",
+                (participant_id, user_id, reason.strip(), status,
+                 open_amendment["id"] if open_amendment else None, now()),
             )
-            self._audit(conn, participant["trial_id"], user_id, "unblinding.request", {"request_id": cur.lastrowid, "participant_id": participant_id})
-            return {"id": cur.lastrowid, "status": "pending"}
+            request_id = cur.lastrowid
+            detail = {"request_id": request_id, "participant_id": participant_id}
+            if open_amendment:
+                detail["held_for_amendment"] = open_amendment["application_no"]
+                self._audit(conn, participant["trial_id"], user_id, "unblinding.materials_pending", detail)
+                return {"id": request_id, "request_no": self._request_no(request_id),
+                        "status": "materials_pending",
+                        "message": f"版本申请 {open_amendment['application_no']} 未完成，揭盲停在待补材料，审核结束后自动转待审批",
+                        "amendment_application_no": open_amendment["application_no"]}
+            self._audit(conn, participant["trial_id"], user_id, "unblinding.request", detail)
+            return {"id": request_id, "request_no": self._request_no(request_id), "status": "pending"}
+
+    @staticmethod
+    def _request_no(request_id):
+        return f"UB-{request_id:05d}"
+
+    def list_unblinding_requests(self, user_id, trial_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            sql = """SELECT r.*, p.external_id AS external_id, p.site_id AS site_id,
+                            a.arm AS arm, am.application_no AS amendment_application_no
+                     FROM unblinding_requests r
+                     JOIN participants p ON p.id = r.participant_id
+                     JOIN allocations a ON a.id = p.allocation_id
+                     LEFT JOIN protocol_amendments am ON am.id = r.amendment_id
+                     WHERE p.trial_id=?"""
+            params = [trial_id]
+            if actor["role"] == "site":
+                sql += " AND p.site_id=?"
+                params.append(actor["site_id"])
+            sql += " ORDER BY r.id"
+            rows = conn.execute(sql, params).fetchall()
+            result = []
+            for r in rows:
+                item = {
+                    "id": r["id"], "request_no": self._request_no(r["id"]),
+                    "participant_id": r["participant_id"], "external_id": r["external_id"],
+                    "site_id": r["site_id"], "requester_id": r["requester_id"],
+                    "reason": r["reason"], "status": r["status"],
+                    "first_approver": r["first_approver"], "second_approver": r["second_approver"],
+                    "amendment_application_no": r["amendment_application_no"],
+                    "created_at": r["created_at"], "decided_at": r["decided_at"],
+                }
+                # 组别仅在双人审批通过后才返回；监查员平时看不到
+                if r["status"] == "approved":
+                    item["arm"] = r["arm"]
+                result.append(item)
+            return {"items": result}
 
     def approve_unblinding(self, user_id, request_id):
         with self.connect() as conn:
@@ -354,15 +629,20 @@ class RandomizationStore:
                 request = conn.execute("SELECT * FROM unblinding_requests WHERE id=?", (request_id,)).fetchone()
                 if not request:
                     raise BusinessError("揭盲申请不存在", 404, "not_found")
-                if request["status"] != "pending":
+                if request["status"] in ("approved", "rejected"):
                     raise BusinessError("揭盲申请已经完成", 409, "already_decided")
+                if request["status"] == "materials_pending":
+                    raise BusinessError("版本申请尚未完成，揭盲停在待补材料，暂不能确认", 409, "materials_pending")
+                if request["requester_id"] == user_id:
+                    raise BusinessError("发起人不能作为揭盲确认人", 409, "requester_cannot_approve")
                 if request["first_approver"] is None:
                     conn.execute("UPDATE unblinding_requests SET first_approver=? WHERE id=?", (user_id, request_id))
                     participant = conn.execute("SELECT * FROM participants WHERE id=?", (request["participant_id"],)).fetchone()
                     self._audit(conn, participant["trial_id"], user_id, "unblinding.approve.first", {"request_id": request_id})
-                    return {"id": request_id, "status": "pending", "first_approver": user_id, "second_approval_required": True}
+                    return {"id": request_id, "request_no": self._request_no(request_id),
+                            "status": "pending", "first_approver": user_id, "second_confirmation_required": True}
                 if request["first_approver"] == user_id:
-                    raise BusinessError("两次揭盲审批必须由不同人员完成", 409, "distinct_approver_required")
+                    raise BusinessError("两次揭盲确认必须由不同人员完成", 409, "distinct_approver_required")
                 conn.execute(
                     "UPDATE unblinding_requests SET second_approver=?,status='approved',decided_at=? WHERE id=?",
                     (user_id, now(), request_id),
@@ -370,7 +650,8 @@ class RandomizationStore:
                 participant = conn.execute("SELECT * FROM participants WHERE id=?", (request["participant_id"],)).fetchone()
                 arm = conn.execute("SELECT arm FROM allocations WHERE id=?", (participant["allocation_id"],)).fetchone()["arm"]
                 self._audit(conn, participant["trial_id"], user_id, "unblinding.approve.second", {"request_id": request_id, "participant_id": participant["id"]})
-                return {"id": request_id, "status": "approved", "first_approver": request["first_approver"], "second_approver": user_id, "arm": arm}
+                return {"id": request_id, "request_no": self._request_no(request_id), "status": "approved",
+                        "first_approver": request["first_approver"], "second_approver": user_id, "arm": arm}
             except Exception:
                 conn.rollback()
                 raise
@@ -387,9 +668,14 @@ class RandomizationStore:
                 f"SELECT site_id,COUNT(*) AS count FROM participants WHERE trial_id=?" + where + " GROUP BY site_id", params
             ).fetchall()
             audit = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
+            open_amendment = conn.execute(
+                "SELECT application_no FROM protocol_amendments WHERE trial_id=? AND status='pending_review'", (trial_id,)
+            ).fetchone()
             return {
                 "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"]},
                 "participants_visible": total, "by_site": [dict(x) for x in by_site],
+                "enrollment_paused": open_amendment is not None,
+                "pending_amendment_application_no": open_amendment["application_no"] if open_amendment else None,
                 "audit": [dict(x) | {"detail": json.loads(x["detail"])} for x in audit],
             }
 
@@ -414,6 +700,8 @@ class Handler(BaseHTTPRequestHandler):
             body = (BASE_DIR / "web" / "index.html").read_bytes(); self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(body)))
             self.end_headers(); self.wfile.write(body); return
+        if method == "GET" and path.startswith("/static/"):
+            return self._static(path[len("/static/"):])
         if method == "GET" and path == "/health": return self._send(200, {"ok": True})
         if parts == ["api", "trials"] and method == "POST":
             d=self._body(); return self._send(201, store.create_trial(user,d.get("name",""),d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed","")))
@@ -422,6 +710,11 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="protocol" and method=="POST":
                 d=self._body(); return self._send(200, store.update_protocol(user,trial_id,d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed")))
             if len(parts)==4 and parts[3]=="start" and method=="POST": return self._send(200, store.start_trial(user,trial_id))
+            if len(parts)==4 and parts[3]=="config" and method=="GET": return self._send(200, store.trial_config(user,trial_id))
+            if len(parts)==4 and parts[3]=="amendments" and method=="GET": return self._send(200, {"items": store.list_amendments(user,trial_id)})
+            if len(parts)==4 and parts[3]=="amendments" and method=="POST":
+                d=self._body(); return self._send(201, store.submit_amendment(user,trial_id,d.get("new_version",""),d.get("reason",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed")))
+            if len(parts)==4 and parts[3]=="unblinding-requests" and method=="GET": return self._send(200, store.list_unblinding_requests(user,trial_id))
             if len(parts)==4 and parts[3]=="participants" and method=="GET": return self._send(200, {"items": store.list_participants(user,trial_id)})
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
@@ -431,7 +724,20 @@ class Handler(BaseHTTPRequestHandler):
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
         if len(parts)==4 and parts[:2]==["api","unblinding-requests"] and parts[3]=="approve" and method=="POST":
             return self._send(200, store.approve_unblinding(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","amendments"] and parts[3]=="review" and method=="POST":
+            d=self._body(); return self._send(200, store.review_amendment(user,int(parts[2]),d.get("decision",""),d.get("note","")))
         raise BusinessError("接口不存在",404,"not_found")
+    def _static(self, name):
+        safe = Path(name).name
+        if not safe or safe != name:
+            raise BusinessError("静态资源路径非法", 400, "bad_path")
+        target = (BASE_DIR / "web" / safe).resolve()
+        if BASE_DIR.joinpath("web").resolve() not in target.parents or not target.is_file():
+            raise BusinessError("资源不存在", 404, "not_found")
+        ctype = "text/css; charset=utf-8" if target.suffix == ".css" else "application/javascript; charset=utf-8"
+        body = target.read_bytes(); self.send_response(200)
+        self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
     def _handle(self, method):
         try: self._dispatch(method)
         except BusinessError as exc: self._send(exc.status,{"error":{"code":exc.code,"message":exc.message}})

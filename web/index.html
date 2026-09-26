@@ -1,4 +1,79 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>方案修订与紧急揭盲工作台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>方案修订与紧急揭盲工作台</h1>
+    <div class="identity">
+      <label>当前身份
+        <select id="user">
+          <option value="coord">项目协调员 coord</option>
+          <option value="monitor1">独立监查员甲 monitor1</option>
+          <option value="monitor2">独立监查员乙 monitor2</option>
+          <option value="site1">中心一协调员 site1</option>
+          <option value="site2">中心二协调员 site2</option>
+        </select>
+      </label>
+      <label>试验编号 <input id="trialId" type="number" value="1" min="1"></label>
+      <button id="loadBtn" class="primary">载入试验</button>
+    </div>
+  </header>
+
+  <section id="banner" class="banner hidden"></section>
+
+  <main class="grid">
+    <!-- 方案版本修订 -->
+    <section class="card" id="amendmentCard">
+      <h2>方案版本修订</h2>
+      <div id="trialMeta" class="meta">尚未载入试验。</div>
+
+      <form id="amendmentForm" class="stack">
+        <div class="row">
+          <label>新版本号 <input id="newVersion" required placeholder="例如 v1.1"></label>
+          <label>区组长度 <input id="blockSize" type="number" min="2" required></label>
+        </div>
+        <label>试验组（逗号分隔）<input id="arms" required></label>
+        <label>分层因素（逗号分隔）<input id="strataFactors" required></label>
+        <label>修订原因（必填，至少 8 字）
+          <textarea id="reason" rows="3" required placeholder="请描述本次修订原因，系统将同时快照已入组名单"></textarea>
+        </label>
+        <p class="hint">提交后系统自动核对旧分层能否沿用；不兼容将直接退回。审核期间本试验暂停新入组。</p>
+        <button type="submit" class="primary">提交版本申请</button>
+      </form>
+
+      <div id="amendmentResult" class="result hidden"></div>
+
+      <h3>版本申请记录</h3>
+      <div id="amendmentList" class="list">暂无记录。</div>
+    </section>
+
+    <!-- 紧急揭盲 -->
+    <section class="card" id="unblindCard">
+      <h2>紧急揭盲</h2>
+      <p class="hint">监查员平时看不到任何受试者组别；仅在严重不良事件时发起，经两名不同人员先后确认后才显示。</p>
+
+      <form id="unblindForm" class="stack">
+        <label>受试者编号（本中心/系统内序号）
+          <input id="participantId" type="number" min="1" required placeholder="例如 1">
+        </label>
+        <label>揭盲原因（必填，至少 8 字）
+          <textarea id="unblindReason" rows="3" required placeholder="例如：受试者发生严重不良事件，需立即明确用药组别以指导抢救"></textarea>
+        </label>
+        <button type="submit" class="danger">发起紧急揭盲</button>
+      </form>
+
+      <div id="unblindResult" class="result hidden"></div>
+
+      <h3>揭盲状态</h3>
+      <div id="unblindList" class="list">载入试验后显示。</div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

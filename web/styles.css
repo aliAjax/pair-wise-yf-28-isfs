@@ -1,0 +1,94 @@
+:root {
+  --line: #c9d2dc;
+  --bg-soft: #f4f7fa;
+  --primary: #1f5fa8;
+  --danger: #b3261e;
+  --warn-bg: #fff7e6;
+  --warn-line: #e0a800;
+  --ok-bg: #eef8f0;
+  --ok-line: #2f9e44;
+  --bad-bg: #fdeceb;
+  --bad-line: #c0392b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font: 15px/1.55 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #1f2933; margin: 0; background: var(--bg-soft);
+}
+
+.topbar {
+  background: #123456; color: #fff; padding: 16px 24px;
+}
+.topbar h1 { margin: 0 0 10px; font-size: 20px; }
+.identity { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.identity label { font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.identity select, .identity input { padding: 6px 8px; border-radius: 4px; border: 1px solid var(--line); }
+
+.banner {
+  margin: 16px 24px 0; padding: 12px 16px; border-radius: 8px;
+  border: 1px solid var(--warn-line); background: var(--warn-bg); font-weight: 600;
+}
+.banner.hidden { display: none; }
+
+.grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
+  padding: 20px 24px 40px; align-items: start;
+}
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+.card {
+  background: #fff; border: 1px solid var(--line); border-radius: 10px;
+  padding: 18px 20px; box-shadow: 0 1px 3px rgba(15, 40, 70, .06);
+}
+.card h2 { margin: 0 0 6px; font-size: 17px; color: #123456; }
+.card h3 { margin: 20px 0 8px; font-size: 15px; border-top: 1px dashed var(--line); padding-top: 14px; }
+
+.meta { font-size: 13px; color: #52606d; background: var(--bg-soft); border-radius: 6px; padding: 8px 12px; margin-bottom: 14px; }
+.meta b { color: #123456; }
+.hint { font-size: 12.5px; color: #6b7785; margin: 4px 0; }
+
+.stack { display: flex; flex-direction: column; gap: 10px; }
+.stack label { font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.row { display: flex; gap: 12px; }
+.row label { flex: 1; }
+
+input, textarea, select {
+  font: inherit; padding: 7px 9px; border: 1px solid var(--line); border-radius: 5px; width: 100%;
+}
+textarea { resize: vertical; }
+
+button {
+  font: inherit; padding: 8px 16px; border-radius: 5px; border: 1px solid var(--line);
+  background: #eef1f5; cursor: pointer;
+}
+button:hover { filter: brightness(.97); }
+button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+button.link { border: none; background: none; color: var(--primary); padding: 2px 6px; }
+
+.result { margin-top: 12px; padding: 10px 14px; border-radius: 6px; font-size: 13.5px; white-space: pre-wrap; }
+.result.hidden { display: none; }
+.result.ok { background: var(--ok-bg); border: 1px solid var(--ok-line); }
+.result.bad { background: var(--bad-bg); border: 1px solid var(--bad-line); }
+.result.warn { background: var(--warn-bg); border: 1px solid var(--warn-line); }
+.result.arm { font-size: 18px; font-weight: 700; }
+
+.list { display: flex; flex-direction: column; gap: 10px; font-size: 13px; color: #3e4c59; }
+
+.item { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.item .head { display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; }
+.item .no { font-weight: 700; color: #123456; }
+.item .sub { color: #6b7785; margin-top: 3px; }
+.item .enrolled { margin-top: 8px; max-height: 120px; overflow: auto; background: var(--bg-soft); border-radius: 5px; padding: 6px 10px; }
+.item .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.item .review-note { width: 100%; margin-top: 8px; }
+
+.tag { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+.tag.pending_review, .tag.pending { background: var(--warn-bg); border-color: var(--warn-line); color: #8a6100; }
+.tag.materials_pending { background: #eef3fb; border-color: var(--primary); color: var(--primary); }
+.tag.approved { background: var(--ok-bg); border-color: var(--ok-line); color: #1e6b30; }
+.tag.returned, .tag.rejected { background: var(--bad-bg); border-color: var(--bad-line); color: var(--danger); }
+
+.arm-reveal { margin-top: 8px; padding: 8px 12px; border-radius: 6px; background: var(--ok-bg); border: 1px dashed var(--ok-line); font-weight: 700; }
