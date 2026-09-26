@@ -1,4 +1,99 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>临床试验工作台 · 方案版本与紧急揭盲</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>临床试验工作台</h1>
+      <p class="sub">方案版本变更申请 · 紧急揭盲（双人确认）</p>
+    </div>
+    <div class="topbar-side">
+      <label>当前操作人
+        <select id="user">
+          <option value="coord">coord · 项目协调员</option>
+          <option value="site1">site1 · 中心一协调员</option>
+          <option value="site2">site2 · 中心二协调员</option>
+          <option value="monitor1">monitor1 · 独立监查员甲</option>
+          <option value="monitor2">monitor2 · 独立监查员乙</option>
+        </select>
+      </label>
+      <label>试验 ID <input id="trial-id" value="1" inputmode="numeric"></label>
+      <button id="refresh" type="button">刷新</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <nav class="tabs">
+    <button type="button" class="tab active" data-tab="version">方案版本申请</button>
+    <button type="button" class="tab" data-tab="unblinding">紧急揭盲</button>
+  </nav>
+
+  <!-- ================= 方案版本 ================= -->
+  <section id="tab-version" class="tab-panel">
+    <div class="grid">
+      <div class="panel">
+        <h2>提交新版本申请</h2>
+        <p class="hint">入组开始后方案锁定：变更原因与<b>已入组名单（系统自动归档）</b>随申请提交，系统先核对旧分层能否沿用；不兼容直接退回，兼容则进入审核，<b>审核期间暂停新入组</b>。</p>
+        <form id="version-form">
+          <label>新版本号 <input name="protocol_version" placeholder="例如 v2.0" required></label>
+          <label>变更原因（≥10 字）
+            <textarea name="change_reason" rows="3" placeholder="说明本次修订的医学/统计学原因" required></textarea>
+          </label>
+          <fieldset>
+            <legend>拟变更配置（留空沿用上一版本）</legend>
+            <label>试验组（逗号分隔） <input name="arms" placeholder="A, B"></label>
+            <label>分层因素（逗号分隔）<em class="warn">增删分层因素将导致旧分层不兼容、申请被退回</em>
+              <input name="strata_factors" placeholder="risk">
+            </label>
+            <label>区组长度 <input name="block_size" inputmode="numeric" placeholder="4"></label>
+            <label>随机种子（≥8 位） <input name="seed" placeholder="seed-2026-002"></label>
+          </fieldset>
+          <div class="roster-preview">
+            本次将归档已入组名单：<b id="roster-count">-</b> 人
+            <button type="button" id="toggle-roster" class="link-btn">查看名单</button>
+            <ul id="roster-list" class="roster hidden"></ul>
+          </div>
+          <button type="submit" class="primary">提交版本申请</button>
+        </form>
+        <div id="version-msg" class="msg"></div>
+      </div>
+
+      <div class="panel">
+        <h2>版本申请记录</h2>
+        <div id="version-list" class="cards"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 紧急揭盲 ================= -->
+  <section id="tab-unblinding" class="tab-panel hidden">
+    <div class="grid">
+      <div class="panel">
+        <h2>发起紧急揭盲</h2>
+        <p class="hint">监查员平时看不到受试者组别；仅在 SAE 等紧急情况下发起，经<b>两名与申请人不同的人员</b>分别确认后才显示组别。若有未完成的版本申请，本申请将停在<b>“待补材料”</b>并显示版本申请编号，版本审核结束后补交材料再送审。</p>
+        <form id="unblind-form">
+          <label>受试者 ID（participant_id） <input name="participant_id" inputmode="numeric" required></label>
+          <label>揭盲原因（≥8 字）
+            <textarea name="reason" rows="3" placeholder="例如：受试者发生严重不良事件，需立即明确用药以决定抢救方案" required></textarea>
+          </label>
+          <button type="submit" class="primary danger">发起揭盲申请</button>
+        </form>
+        <div id="unblind-msg" class="msg"></div>
+      </div>
+
+      <div class="panel">
+        <h2>揭盲申请状态</h2>
+        <div id="unblind-list" class="cards"></div>
+      </div>
+    </div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
